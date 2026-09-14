@@ -1,0 +1,152 @@
+name: Build IN THE VOID APK
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Prepare web bundle (offline-capable)
+        run: npm run build:web
+
+      - name: Add Android project
+        run: npx cap add android
+
+      - name: Generate launcher and splash assets
+        run: npx capacitor-assets generate --android
+
+      - name: Set release version
+        run: |
+          # The currently-distributed release APK (checked directly, not assumed) is
+          # versionCode 11 / versionName 1.2.0. Android refuses to install an "update" whose
+          # versionCode is not strictly greater than the one already installed, so the floor
+          # below must never regress even if this workflow's run-number history changes (e.g.
+          # after re-running an old workflow file, or moving to a new repo where run numbers
+          # start over). GITHUB_RUN_NUMBER is monotonic within this repo and keeps future builds
+          # increasing on top of that floor.
+          CURRENT_INSTALLED_VERSION_CODE=11
+          COMPUTED=$((GITHUB_RUN_NUMBER + 2))
+          if [ "$COMPUTED" -le "$CURRENT_INSTALLED_VERSION_CODE" ]; then
+            NEXT=$((CURRENT_INSTALLED_VERSION_CODE + 1))
+          else
+            NEXT=$COMPUTED
+          fi
+          echo "ANDROID_VERSION_CODE=$NEXT" >> "$GITHUB_ENV"
+          echo "ANDROID_VERSION_NAME=1.2.1" >> "$GITHUB_ENV"
+
+      - name: Apply IN THE VOID Android fixes
+        run: node scripts/prepare-android.mjs
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Validate release signing secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64" || { echo "Missing ANDROID_KEYSTORE_BASE64"; exit 1; }
+          test -n "$ANDROID_KEYSTORE_PASSWORD" || { echo "Missing ANDROID_KEYSTORE_PASSWORD"; exit 1; }
+          test -n "$ANDROID_KEY_ALIAS" || { echo "Missing ANDROID_KEY_ALIAS"; exit 1; }
+          test -n "$ANDROID_KEY_PASSWORD" || { echo "Missing ANDROID_KEY_PASSWORD"; exit 1; }
+
+      - name: Restore release keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/in_the_void_release.jks
+          chmod 600 android/in_the_void_release.jks
+
+      - name: Build signed Release APK
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/android/in_the_void_release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Verify APK identity, version and release signature
+        shell: bash
+        env:
+          ANDROID_EXPECTED_CERT_SHA1: ${{ secrets.ANDROID_EXPECTED_CERT_SHA1 }}
+        run: |
+          APK="android/app/build/outputs/apk/release/app-release.apk"
+          test -f "$APK"
+
+          # Re-use the exact versionCode/versionName this build was told to use (exported to
+          # GITHUB_ENV in the "Set release version" step above), instead of recomputing them here
+          # from GITHUB_RUN_NUMBER. Two independent copies of the same formula drift apart the
+          # moment either one is edited without the other - exactly the kind of bug this file has
+          # caused before.
+          test -n "$ANDROID_VERSION_CODE"
+          test -n "$ANDROID_VERSION_NAME"
+          AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -1)"
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -1)"
+          test -n "$AAPT"
+          test -n "$APKSIGNER"
+
+          BADGING="$("$AAPT" dump badging "$APK")"
+          echo "$BADGING" | grep -F "package: name='com.inthevoid.platform' versionCode='$ANDROID_VERSION_CODE' versionName='$ANDROID_VERSION_NAME'"
+
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+          ACTUAL_SHA1="$("$APKSIGNER" verify --print-certs "$APK" | grep -m1 'SHA-1' | sed -E 's/.*SHA-1[^:]*:\s*//')"
+          echo "Release APK signing certificate SHA-1: $ACTUAL_SHA1"
+
+          # Pin the expected certificate via a secret instead of a value hardcoded in this file.
+          # A hardcoded fingerprint silently goes stale the moment the signing keystore is
+          # rotated (on purpose or by mistake) and then fails every future build for a reason
+          # that is not obvious from this file alone. If you want this workflow to hard-fail on
+          # an unexpected signing key, add a repository secret named ANDROID_EXPECTED_CERT_SHA1
+          # with the certificate's SHA-1 (colon-separated, as printed above) - this step will
+          # then enforce it. Until that secret is set, the fingerprint above is only printed so
+          # you can manually confirm it matches the certificate the currently-installed app was
+          # signed with (an APK can only install as an update over an existing install if both
+          # are signed with the same certificate).
+          if [ -n "${ANDROID_EXPECTED_CERT_SHA1:-}" ]; then
+            echo "$ACTUAL_SHA1" | grep -F "$ANDROID_EXPECTED_CERT_SHA1" || {
+              echo "::error::Signing certificate does not match ANDROID_EXPECTED_CERT_SHA1. This APK cannot install as an update over an app signed with a different key.";
+              exit 1;
+            }
+          fi
+
+          echo "Release APK identity and version verified."
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: IN_THE_VOID-APK-Release
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+      - name: Remove temporary signing keystore
+        if: always()
+        run: rm -f android/in_the_void_release.jks
+
